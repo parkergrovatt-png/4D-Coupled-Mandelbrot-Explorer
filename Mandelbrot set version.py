@@ -1,1 +1,230 @@
+"""
+4D Coupled Mandelbrot Explorer
+Interactive prototype using pygame + numba + numpy.
 
+Controls:
+  Arrow keys : pan (move the 2D Mandelbrot plane)
+  d          : zoom in
+  a          : zoom out
+  w / s      : move the 3rd dimension (real part of k)
+  e          : speed up time
+  q          : slow down time
+  r          : reverse time
+  SPACE      : pause / unpause time
+  ESC / close: quit
+
+Requirements:
+  Python 3.8+
+  pip install numpy numba pygame
+
+Save this file and run: python 4D_Coupled_Mandelbrot_Explorer.py
+
+Notes:
+ - It computes a 2D slice where the pixel grid represents the initial c_0 (the usual Mandelbrot plane).
+ - The third dimension controls Re(k). The fourth dimension is Im(k) and evolves in time.
+ - Coloring uses smooth escape-time and a small palette gradient. Use max_iter/scale values in the code for quality/performance tradeoffs.
+
+This is a single-file prototype meant to be a starting point you can tweak (palette, iterations, performance, etc.).
+"""
+
+import sys
+import time
+import math
+import numpy as np
+import pygame
+from numba import njit, prange
+
+# ---------- Parameters
+WIDTH, HEIGHT = 800, 600
+MAX_ITER = 220
+ESCAPE_RADIUS = 4.0
+
+# initial view (centered like a typical Mandelbrot)
+center_x = -0.6
+center_y = 0.0
+scale = 3.0 / WIDTH  # complex-plane units per pixel (small -> zoom in)
+
+# k parameter (k = k_real + 1j * k_imag(t))
+c_real = 0.0
+c_imag_t = 0.0
+
+# time control
+time_speed = 0.5    # how fast the 4th dimension (imag part of k) advances
+time_direction = 1  # 1 or -1
+paused = False
+
+# incremental control sensitivities
+PAN_STEP = 0.01 * (scale * WIDTH)
+ZOOM_FACTOR = 0.7
+c_REAL_STEP = 0.02
+TIME_SPEED_MULT = 1.4
+
+# color gradient control points (R,G,B) 0-255
+PALETTE = np.array([
+    (16, 32, 128),   # deep blue
+    (32, 200, 200),  # cyan
+    (240, 240, 64),  # yellow
+    (200, 32, 32),   # red
+    (0, 0, 0)        # fallback (for interior points)
+], dtype=np.uint8)
+
+# ---------- Numba-accelerated core
+@njit(parallel=True, fastmath=True)
+def compute_frame(width, height, cx, cy, scale, k_real, k_imag, c_real, c_imag, max_iter, escape_radius):
+    img = np.empty((height, width, 3), dtype=np.uint8)
+    # pre-calc
+    half_w = width / 2.0
+    half_h = height / 2.0
+    for j in prange(height):
+        y0 = (j - half_h) * scale + cy
+        for i in range(width):
+            x0 = (i - half_w) * scale + cx
+
+            # k is the pixel coordinate — the thing we’re iterating over
+            k = complex(x0, y0)
+
+            # c is the fixed parameter (previously controlled by W/S/Q/E)
+            c = complex(c_real, c_imag)
+
+            z = complex(0.0, 0.0)
+
+            escaped = False
+            for n in range(max_iter):
+                z = z*z + k
+                if (z.real*z.real + z.imag*z.imag) > (escape_radius*escape_radius):
+                    escaped = True
+                    break
+
+            if not escaped:
+                # inside set: paint black (last palette entry)
+                img[j, i, 0] = PALETTE[-1, 0]
+                img[j, i, 1] = PALETTE[-1, 1]
+                img[j, i, 2] = PALETTE[-1, 2]
+            else:
+                # smooth iteration (use z for smoothing if it escaped via z, else use c_iter)
+                mag = math.sqrt(z.real * z.real + z.imag * z.imag)
+                # guard against log of zero
+                if mag <= 0.0:
+                    mu = n
+                else:
+                    # classic smoothing: nu = n + 1 - log(log|z|)/log 2
+                    mu = n + 1 - math.log(math.log(mag) / math.log(2.0)) / math.log(2.0)
+                # normalize
+                t = mu / max_iter
+                # map t to palette gradient (4 control points)
+                # stretch t a bit for visual interest
+                t = t * 3.0
+                if t <= 0.0:
+                    cR, cG, cB = PALETTE[0]
+                elif t < 1.0:
+                    a = t
+                    c0 = PALETTE[0]
+                    c1 = PALETTE[1]
+                    cR = int(c0[0] + (c1[0] - c0[0]) * a)
+                    cG = int(c0[1] + (c1[1] - c0[1]) * a)
+                    cB = int(c0[2] + (c1[2] - c0[2]) * a)
+                elif t < 2.0:
+                    a = t - 1.0
+                    c0 = PALETTE[1]
+                    c1 = PALETTE[2]
+                    cR = int(c0[0] + (c1[0] - c0[0]) * a)
+                    cG = int(c0[1] + (c1[1] - c0[1]) * a)
+                    cB = int(c0[2] + (c1[2] - c0[2]) * a)
+                else:
+                    a = min(1.0, t - 2.0)
+                    c0 = PALETTE[2]
+                    c1 = PALETTE[3]
+                    cR = int(c0[0] + (c1[0] - c0[0]) * a)
+                    cG = int(c0[1] + (c1[1] - c0[1]) * a)
+                    cB = int(c0[2] + (c1[2] - c0[2]) * a)
+
+                img[j, i, 0] = cR
+                img[j, i, 1] = cG
+                img[j, i, 2] = cB
+    return img
+
+# ---------- Pygame main loop
+
+def main():
+    global center_x, center_y, scale, k_real, k_imag_t
+    global time_speed, time_direction, paused
+
+    pygame.init()
+    screen = pygame.display.set_mode((WIDTH, HEIGHT))
+    pygame.display.set_caption('4D Coupled Mandelbrot Explorer')
+    clock = pygame.time.Clock()
+
+    last_time = time.time()
+    running = True
+
+    # warm-up compile numba function with a tiny call
+    _ = compute_frame(8, 6, center_x, center_y, scale, k_real, k_imag_t, 10, ESCAPE_RADIUS)
+
+    while running:
+        dt = clock.tick(30) / 1000.0  # seconds per frame (cap 30 fps)
+        for ev in pygame.event.get():
+            if ev.type == pygame.QUIT:
+                running = False
+            elif ev.type == pygame.KEYDOWN:
+                if ev.key == pygame.K_ESCAPE:
+                    running = False
+                elif ev.key == pygame.K_SPACE:
+                    paused = not paused
+                elif ev.key == pygame.K_r:
+                    time_direction *= -1
+                elif ev.key == pygame.K_e:
+                    time_speed *= TIME_SPEED_MULT
+                elif ev.key == pygame.K_q:
+                    time_speed /= TIME_SPEED_MULT
+                elif ev.key == pygame.K_d:
+                    # zoom in
+                    scale *= ZOOM_FACTOR
+                elif ev.key == pygame.K_a:
+                    # zoom out
+                    scale /= ZOOM_FACTOR
+
+        # continuous key holds
+        keys = pygame.key.get_pressed()
+        if keys[pygame.K_LEFT]:
+            center_x -= PAN_STEP * scale * WIDTH
+        if keys[pygame.K_RIGHT]:
+            center_x += PAN_STEP * scale * WIDTH
+        if keys[pygame.K_UP]:
+            center_y -= PAN_STEP * scale * HEIGHT
+        if keys[pygame.K_DOWN]:
+            center_y += PAN_STEP * scale * HEIGHT
+        if keys[pygame.K_w]:
+            k_real += K_REAL_STEP * (scale * WIDTH)
+        if keys[pygame.K_s]:
+            k_real -= K_REAL_STEP * (scale * WIDTH)
+
+        # update time (k_imag)
+        if not paused:
+            k_imag_t += time_speed * time_direction * dt
+
+        # compute frame
+        img = compute_frame(WIDTH, HEIGHT, center_x, center_y, scale,
+                    k_real, k_imag_t, c_real, c_imag, MAX_ITER, ESCAPE_RADIUS)
+
+        # blit to pygame
+        # pygame.surfarray expects array shape (width, height, 3) and dtype=uint8, so transpose
+        surf = pygame.surfarray.make_surface(np.transpose(img, (1, 0, 2)))
+        screen.blit(surf, (0, 0))
+
+        # overlay HUD
+        font = pygame.font.SysFont('Consolas', 14)
+        hud = [f'center=({center_x:.5f},{center_y:.5f}) scale={scale:.3e}',
+               f'k = {k_real:.4f} + {k_imag_t:.4f}i',
+               f'time_speed={time_speed:.3f} dir={time_direction} paused={paused}']
+        y = 6
+        for line in hud:
+            txt = font.render(line, True, (255, 255, 255))
+            screen.blit(txt, (8, y))
+            y += 18
+
+        pygame.display.flip()
+
+    pygame.quit()
+
+if __name__ == '__main__':
+    main()
