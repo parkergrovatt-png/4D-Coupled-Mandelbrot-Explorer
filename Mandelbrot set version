@@ -1,230 +1,230 @@
-"""
-4D Coupled Mandelbrot Explorer
-Interactive prototype using pygame + numba + numpy.
-
-Controls:
-  Arrow keys : pan (move the 2D Mandelbrot plane)
-  d          : zoom in
-  a          : zoom out
-  w / s      : move the 3rd dimension (real part of k)
-  e          : speed up time
-  q          : slow down time
-  r          : reverse time
-  SPACE      : pause / unpause time
-  ESC / close: quit
-
-Requirements:
-  Python 3.8+
-  pip install numpy numba pygame
-
-Save this file and run: python 4D_Coupled_Mandelbrot_Explorer.py
-
-Notes:
- - It computes a 2D slice where the pixel grid represents the initial c_0 (the usual Mandelbrot plane).
- - The third dimension controls Re(k). The fourth dimension is Im(k) and evolves in time.
- - Coloring uses smooth escape-time and a small palette gradient. Use max_iter/scale values in the code for quality/performance tradeoffs.
-
-This is a single-file prototype meant to be a starting point you can tweak (palette, iterations, performance, etc.).
-"""
-
-import sys
-import time
-import math
+# fractal_microscope.py
 import numpy as np
 import pygame
 from numba import njit, prange
+import matplotlib.cm as cm
+import time
 
-# ---------- Parameters
-WIDTH, HEIGHT = 800, 600
-MAX_ITER = 220
+# ----------------------
+# Parameters & settings
+# ----------------------
+WIDTH, HEIGHT = 1000, 800
+MAX_ITER = 300
 ESCAPE_RADIUS = 4.0
+# initial view of k-plane (center + half-width)
+center_kx, center_ky = -0.5, 0.0
+scale = 3.0  # width of view in complex plane (real axis)
+aspect = HEIGHT / WIDTH
 
-# initial view (centered like a typical Mandelbrot)
-center_x = -0.6
-center_y = 0.0
-scale = 3.0 / WIDTH  # complex-plane units per pixel (small -> zoom in)
+# initial c0
+c0_re = 0.0
+c0_im = 0.0
+c_im_velocity = 0.0  # velocity along Im(c0) (units per second)
+c_im_step = 0.02     # keyboard incremental change to velocity
+c_re_step = 0.02     # W/S move step for Re(c0)
 
-# k parameter (k = k_real + 1j * k_imag(t))
-c_real = 0.0
-c_imag_t = 0.0
+# pan & zoom steps
+pan_frac = 0.08
+zoom_factor = 1.1
 
-# time control
-time_speed = 0.5    # how fast the 4th dimension (imag part of k) advances
-time_direction = 1  # 1 or -1
-paused = False
+# performance
+COMPUTE_EVERY_FRAMES = 1  # how many frames between full recompute
+USE_SMOOTH = True
 
-# incremental control sensitivities
-PAN_STEP = 0.01 * (scale * WIDTH)
-ZOOM_FACTOR = 0.7
-c_REAL_STEP = 0.02
-TIME_SPEED_MULT = 1.4
+# colormap
+cmap = cm.get_cmap("twilight_shifted")
 
-# color gradient control points (R,G,B) 0-255
-PALETTE = np.array([
-    (16, 32, 128),   # deep blue
-    (32, 200, 200),  # cyan
-    (240, 240, 64),  # yellow
-    (200, 32, 32),   # red
-    (0, 0, 0)        # fallback (for interior points)
-], dtype=np.uint8)
-
-# ---------- Numba-accelerated core
+# ----------------------
+# Numba-accelerated compute
+# ----------------------
 @njit(parallel=True, fastmath=True)
-def compute_frame(width, height, cx, cy, scale, k_real, k_imag, c_real, c_imag, max_iter, escape_radius):
-    img = np.empty((height, width, 3), dtype=np.uint8)
-    # pre-calc
-    half_w = width / 2.0
-    half_h = height / 2.0
+def compute_fractal(width, height, center_kx, center_ky, scale,
+                    c0_re, c0_im, max_iter, escape_radius, smooth):
+    result = np.zeros((height, width), dtype=np.float64)
+    half_w = scale / 2.0
+    dx = scale / width
+    dy = (scale * (height/width)) / height  # maintain aspect ratio
+    y0 = center_ky - (dy * height / 2.0)
+    x0 = center_kx - (dx * width / 2.0)
+
     for j in prange(height):
-        y0 = (j - half_h) * scale + cy
+        ky = y0 + j * dy
         for i in range(width):
-            x0 = (i - half_w) * scale + cx
+            kx = x0 + i * dx
+            k_real = kx
+            k_imag = ky
 
-            # k is the pixel coordinate — the thing we’re iterating over
-            k = complex(x0, y0)
+            z_re = 0.0
+            z_im = 0.0
+            c_re = c0_re
+            c_im = c0_im
 
-            # c is the fixed parameter (previously controlled by W/S/Q/E)
-            c = complex(c_real, c_imag)
-
-            z = complex(0.0, 0.0)
-
-            escaped = False
+            escape_iter = max_iter
             for n in range(max_iter):
-                z = z*z + k
-                if (z.real*z.real + z.imag*z.imag) > (escape_radius*escape_radius):
-                    escaped = True
+                # z = z^2 + c
+                # compute z*z
+                zr2 = z_re * z_re
+                zi2 = z_im * z_im
+                z_im = 2.0 * z_re * z_im + c_im
+                z_re = zr2 - zi2 + c_re
+
+                # c = c^2 + k
+                cr2 = c_re * c_re
+                ci2 = c_im * c_im
+                c_im = 2.0 * c_re * c_im + k_imag
+                c_re = cr2 - ci2 + k_real
+
+                # check escape
+                modz2 = z_re * z_re + z_im * z_im
+                modc2 = c_re * c_re + c_im * c_im
+                if modz2 > escape_radius*escape_radius or modc2 > escape_radius*escape_radius:
+                    escape_iter = n
+                    if smooth:
+                        # smooth the escape for z if possible, fallback on n
+                        if modz2 > 0:
+                            # approximation using log log for smooth coloring
+                            log_zn = 0.5 * np.log(modz2)
+                            nu = np.log(log_zn / np.log(2.0)) / np.log(2.0)
+                            escape_iter = n + 1 - nu
                     break
 
-            if not escaped:
-                # inside set: paint black (last palette entry)
-                img[j, i, 0] = PALETTE[-1, 0]
-                img[j, i, 1] = PALETTE[-1, 1]
-                img[j, i, 2] = PALETTE[-1, 2]
-            else:
-                # smooth iteration (use z for smoothing if it escaped via z, else use c_iter)
-                mag = math.sqrt(z.real * z.real + z.imag * z.imag)
-                # guard against log of zero
-                if mag <= 0.0:
-                    mu = n
-                else:
-                    # classic smoothing: nu = n + 1 - log(log|z|)/log 2
-                    mu = n + 1 - math.log(math.log(mag) / math.log(2.0)) / math.log(2.0)
-                # normalize
-                t = mu / max_iter
-                # map t to palette gradient (4 control points)
-                # stretch t a bit for visual interest
-                t = t * 3.0
-                if t <= 0.0:
-                    cR, cG, cB = PALETTE[0]
-                elif t < 1.0:
-                    a = t
-                    c0 = PALETTE[0]
-                    c1 = PALETTE[1]
-                    cR = int(c0[0] + (c1[0] - c0[0]) * a)
-                    cG = int(c0[1] + (c1[1] - c0[1]) * a)
-                    cB = int(c0[2] + (c1[2] - c0[2]) * a)
-                elif t < 2.0:
-                    a = t - 1.0
-                    c0 = PALETTE[1]
-                    c1 = PALETTE[2]
-                    cR = int(c0[0] + (c1[0] - c0[0]) * a)
-                    cG = int(c0[1] + (c1[1] - c0[1]) * a)
-                    cB = int(c0[2] + (c1[2] - c0[2]) * a)
-                else:
-                    a = min(1.0, t - 2.0)
-                    c0 = PALETTE[2]
-                    c1 = PALETTE[3]
-                    cR = int(c0[0] + (c1[0] - c0[0]) * a)
-                    cG = int(c0[1] + (c1[1] - c0[1]) * a)
-                    cB = int(c0[2] + (c1[2] - c0[2]) * a)
+            result[j, i] = escape_iter / max_iter
 
-                img[j, i, 0] = cR
-                img[j, i, 1] = cG
-                img[j, i, 2] = cB
-    return img
 
-# ---------- Pygame main loop
+    return result
 
+# ----------------------
+# Helper: map to RGB surface
+# ----------------------
+def array_to_surface(arr, colormap):
+    # arr in 0..1 float
+    rgba = colormap(arr, bytes=True)  # returns uint8 RGBA
+    rgb = rgba[:, :, :3]
+    surf = pygame.surfarray.make_surface(np.transpose(rgb, (1, 0, 2)))
+    return surf
+
+# ----------------------
+# Main loop: pygame app
+# ----------------------
 def main():
-    global center_x, center_y, scale, k_real, k_imag_t
-    global time_speed, time_direction, paused
+    global center_kx, center_ky, scale, c0_re, c0_im, c_im_velocity
 
     pygame.init()
     screen = pygame.display.set_mode((WIDTH, HEIGHT))
-    pygame.display.set_caption('4D Coupled Mandelbrot Explorer')
+    pygame.display.set_caption("4D Fractal Microscope — k-plane explorer")
     clock = pygame.time.Clock()
 
+    needs_compute = True
+    frame_count = 0
     last_time = time.time()
     running = True
+    paused = False
 
-    # warm-up compile numba function with a tiny call
-    _ = compute_frame(8, 6, center_x, center_y, scale, k_real, k_imag_t, 10, ESCAPE_RADIUS)
+    # simple on-screen font
+    font = pygame.font.SysFont("Consolas", 11)
 
     while running:
-        dt = clock.tick(30) / 1000.0  # seconds per frame (cap 30 fps)
-        for ev in pygame.event.get():
-            if ev.type == pygame.QUIT:
+        dt = clock.tick(30) / 1000.0  # seconds
+        frame_count += 1
+        # handle events
+        for event in pygame.event.get():
+            if event.type == pygame.QUIT:
                 running = False
-            elif ev.type == pygame.KEYDOWN:
-                if ev.key == pygame.K_ESCAPE:
-                    running = False
-                elif ev.key == pygame.K_SPACE:
+
+            if event.type == pygame.KEYDOWN:
+                if event.key == pygame.K_SPACE:
                     paused = not paused
-                elif ev.key == pygame.K_r:
-                    time_direction *= -1
-                elif ev.key == pygame.K_e:
-                    time_speed *= TIME_SPEED_MULT
-                elif ev.key == pygame.K_q:
-                    time_speed /= TIME_SPEED_MULT
-                elif ev.key == pygame.K_d:
-                    # zoom in
-                    scale *= ZOOM_FACTOR
-                elif ev.key == pygame.K_a:
-                    # zoom out
-                    scale /= ZOOM_FACTOR
+                if event.key == pygame.K_r:
+                    c_im_velocity = -c_im_velocity
+                if event.key == pygame.K_a:  # zoom out
+                    # zoom out centered
+                    scale *= zoom_factor
+                    needs_compute = True
+                if event.key == pygame.K_d:  # zoom in
+                    scale /= zoom_factor
+                    needs_compute = True
 
-        # continuous key holds
+        # continuous key states
         keys = pygame.key.get_pressed()
+        # pan k-plane with arrows (fraction of current scale)
+        pan_x = 0.0
+        pan_y = 0.0
         if keys[pygame.K_LEFT]:
-            center_x -= PAN_STEP * scale * WIDTH
+            pan_x = -pan_frac * scale
         if keys[pygame.K_RIGHT]:
-            center_x += PAN_STEP * scale * WIDTH
+            pan_x = pan_frac * scale
         if keys[pygame.K_UP]:
-            center_y -= PAN_STEP * scale * HEIGHT
+            pan_y = -pan_frac * (scale * (HEIGHT/WIDTH))
         if keys[pygame.K_DOWN]:
-            center_y += PAN_STEP * scale * HEIGHT
+            pan_y = pan_frac * (scale * (HEIGHT/WIDTH))
+        if pan_x != 0.0 or pan_y != 0.0:
+            center_kx += pan_x * dt * 10.0  # multiply by dt to make speed smooth
+            center_ky += pan_y * dt * 10.0
+            needs_compute = True
+
+        # W/S move Re(c0)
         if keys[pygame.K_w]:
-            k_real += K_REAL_STEP * (scale * WIDTH)
+            c0_re += c_re_step * dt * 10.0
+            needs_compute = True
         if keys[pygame.K_s]:
-            k_real -= K_REAL_STEP * (scale * WIDTH)
+            c0_re -= c_re_step * dt * 10.0
+            needs_compute = True
 
-        # update time (k_imag)
+        # Q/E adjust Im(c0) velocity (Q decreases, E increases)
+        if keys[pygame.K_q]:
+            c_im_velocity -= c_im_step * dt * 10.0
+        if keys[pygame.K_e]:
+            c_im_velocity += c_im_step * dt * 10.0
+
+        # Update c_im by its velocity (unless paused)
         if not paused:
-            k_imag_t += time_speed * time_direction * dt
+            prev_c_im = c0_im
+            c0_im += c_im_velocity * dt
+            if abs(c0_im - prev_c_im) > 1e-6:
+                needs_compute = True
 
-        # compute frame
-        img = compute_frame(WIDTH, HEIGHT, center_x, center_y, scale,
-                    k_real, k_imag_t, c_real, c_imag, MAX_ITER, ESCAPE_RADIUS)
+        # compute fractal occasionally or when needed
+        if needs_compute and (frame_count % COMPUTE_EVERY_FRAMES == 0):
+            t0 = time.time()
+            arr = compute_fractal(WIDTH, HEIGHT, center_kx, center_ky, scale,
+                                  c0_re, c0_im, MAX_ITER, ESCAPE_RADIUS, USE_SMOOTH)
+            surf = array_to_surface(arr, cmap)
+            t1 = time.time()
+            compute_time = t1 - t0
+            needs_compute = False
+        # if not computed yet, just fill black
+        if 'surf' not in locals():
+            screen.fill((0, 0, 0))
+        else:
+            screen.blit(surf, (0, 0))
 
-        # blit to pygame
-        # pygame.surfarray expects array shape (width, height, 3) and dtype=uint8, so transpose
-        surf = pygame.surfarray.make_surface(np.transpose(img, (1, 0, 2)))
-        screen.blit(surf, (0, 0))
-
-        # overlay HUD
-        font = pygame.font.SysFont('Consolas', 14)
-        hud = [f'center=({center_x:.5f},{center_y:.5f}) scale={scale:.3e}',
-               f'k = {k_real:.4f} + {k_imag_t:.4f}i',
-               f'time_speed={time_speed:.3f} dir={time_direction} paused={paused}']
-        y = 6
-        for line in hud:
-            txt = font.render(line, True, (255, 255, 255))
-            screen.blit(txt, (8, y))
-            y += 18
+        # HUD overlay
+        info_lines = [
+            f"center_k = ({center_kx:.5f} , {center_ky:.5f})",
+            f"scale = {scale:.5f}",
+            f"c0_re = {c0_re:.5f}    c0_im = {c0_im:.5f}",
+            f"c_im_velocity = {c_im_velocity:.5f} (Q/E to change, R reverse, SPACE pause)",
+            f"MAX_ITER = {MAX_ITER}  compute_time = {compute_time:.3f}s" if 'compute_time' in locals() else "",
+            "Controls: arrows pan k-plane | W/S Re(c0) | Q/E change Im(c0) velocity",
+            "A/D zoom out/in | R reverse Im(c0) motion | SPACE pause/resume"
+        ]
+        y = 8
+        box_w = 420
+        box_h = 16 * len(info_lines) + 8
+        # translucent background
+        s = pygame.Surface((box_w, box_h), pygame.SRCALPHA)
+        s.fill((0, 0, 0, 140))
+        screen.blit(s, (8, 8))
+        for line in info_lines:
+            if not line:
+                continue
+            text_surf = font.render(line, True, (255, 255, 255))
+            screen.blit(text_surf, (12, y))
+            y += 16
 
         pygame.display.flip()
 
     pygame.quit()
 
-if __name__ == '__main__':
+if __name__ == "__main__":
     main()
