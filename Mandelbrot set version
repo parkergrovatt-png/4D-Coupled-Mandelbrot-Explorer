@@ -164,10 +164,10 @@ def main():
 
         # W/S move Re(c0)
         if keys[pygame.K_w]:
-            c0_re += c_re_step * dt * 10.0
+            c0_re += c_re_step * dt * scale * 5.0
             needs_compute = True
         if keys[pygame.K_s]:
-            c0_re -= c_re_step * dt * 10.0
+            c0_re -= c_re_step * dt * scale * 5.0
             needs_compute = True
 
         # Q/E adjust Im(c0) velocity (Q decreases, E increases)
