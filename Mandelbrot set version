@@ -19,7 +19,7 @@ aspect = HEIGHT / WIDTH
 # initial c0
 c0_re = 0.0
 c0_im = 0.0
-c_im_velocity = 0.0  # velocity along Im(c0) (units per second)
+c_im_velocity = 0.01  # velocity along Im(c0) (units per second)
 c_im_step = 0.02     # keyboard incremental change to velocity
 c_re_step = 0.02     # W/S move step for Re(c0)
 
@@ -172,9 +172,9 @@ def main():
 
         # Q/E adjust Im(c0) velocity (Q decreases, E increases)
         if keys[pygame.K_q]:
-            c_im_velocity -= c_im_step * dt * 10.0
+            c_im_velocity /= 1.2
         if keys[pygame.K_e]:
-            c_im_velocity += c_im_step * dt * 10.0
+            c_im_velocity *= 1.2
 
         # Update c_im by its velocity (unless paused)
         if not paused:
