@@ -56,7 +56,7 @@ paused = False
 # incremental control sensitivities
 PAN_STEP = 0.01 * (scale * WIDTH)
 ZOOM_FACTOR = 0.7
-K_REAL_STEP = 0.02
+K_REAL_STEP = 0.01 * (scale * WIDTH)
 TIME_SPEED_MULT = 1.4
 
 # color gradient control points (R,G,B) 0-255
